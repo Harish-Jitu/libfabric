@@ -83,6 +83,38 @@ rxm_ep_rma_reg_iov(struct rxm_ep *rxm_ep, const struct iovec *msg_iov,
 	return FI_SUCCESS;
 }
 
+static bool
+rxm_ep_rma_can_bounce(struct rxm_ep *rxm_ep, const struct fi_msg_rma *msg,
+		      size_t len)
+{
+	uint64_t device;
+
+	return len && len <= rxm_rma_read_bounce_size &&
+	       rxm_ep->msg_mr_local && !rxm_ep->rdm_mr_local &&
+	       rxm_iov_desc_to_hmem_iface_dev(msg->msg_iov, msg->desc,
+					      msg->iov_count, &device) ==
+	       FI_HMEM_SYSTEM;
+}
+
+/* Point the read at pkt.data, which is already registered, and keep the user
+ * iov for rxm_finish_rma() to copy into. */
+static void
+rxm_ep_format_bounce_read(struct rxm_tx_buf *rma_buf, struct fi_msg_rma *msg,
+			  struct iovec *bounce_iov, size_t len)
+{
+	memcpy(rma_buf->rma.iov, msg->msg_iov,
+	       sizeof(*msg->msg_iov) * msg->iov_count);
+	rma_buf->rma.bounce_count = (uint8_t) msg->iov_count;
+	rma_buf->rma.count = 0;
+	rma_buf->pkt.hdr.size = len;
+
+	bounce_iov->iov_base = &rma_buf->pkt.data;
+	bounce_iov->iov_len = len;
+	msg->msg_iov = bounce_iov;
+	msg->desc = &rma_buf->hdr.desc;
+	msg->iov_count = 1;
+}
+
 static ssize_t
 rxm_ep_rma_common(struct rxm_ep *rxm_ep, const struct fi_msg_rma *msg,
 		  uint64_t flags, ssize_t (*rma_msg)(struct fid_ep *ep_fid,
@@ -93,6 +125,8 @@ rxm_ep_rma_common(struct rxm_ep *rxm_ep, const struct fi_msg_rma *msg,
 	struct fi_msg_rma msg_rma = *msg;
 	struct rxm_conn *rxm_conn;
 	void *mr_desc[RXM_IOV_LIMIT] = { 0 };
+	struct iovec bounce_iov;
+	size_t len;
 	ssize_t ret;
 
 	assert(msg->rma_iov_count <= rxm_ep->rxm_info->tx_attr->rma_iov_limit);
@@ -113,14 +147,22 @@ rxm_ep_rma_common(struct rxm_ep *rxm_ep, const struct fi_msg_rma *msg,
 	rma_buf->pkt.ctrl_hdr.type = rxm_ctrl_eager;
 	rma_buf->app_context = msg->context;
 	rma_buf->flags = flags;
+	rma_buf->rma.bounce_count = 0;
 
-	ret = rxm_ep_rma_reg_iov(rxm_ep, msg_rma.msg_iov, msg_rma.desc, mr_desc,
-				 msg_rma.iov_count,
-				 comp_flags & (FI_WRITE | FI_READ), rma_buf);
-	if (OFI_UNLIKELY(ret))
-		goto release;
+	len = ofi_total_iov_len(msg_rma.msg_iov, msg_rma.iov_count);
+	if ((comp_flags & FI_READ) &&
+	    rxm_ep_rma_can_bounce(rxm_ep, &msg_rma, len)) {
+		rxm_ep_format_bounce_read(rma_buf, &msg_rma, &bounce_iov, len);
+	} else {
+		ret = rxm_ep_rma_reg_iov(rxm_ep, msg_rma.msg_iov, msg_rma.desc,
+					 mr_desc, msg_rma.iov_count,
+					 comp_flags & (FI_WRITE | FI_READ),
+					 rma_buf);
+		if (OFI_UNLIKELY(ret))
+			goto release;
 
-	msg_rma.desc = mr_desc;
+		msg_rma.desc = mr_desc;
+	}
 	msg_rma.context = rma_buf;
 
 	ret = rma_msg(rxm_conn_msg_ep(rxm_conn, NULL), &msg_rma, flags);
