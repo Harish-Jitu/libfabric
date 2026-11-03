@@ -291,6 +291,9 @@ rxm_ep_rma_emulate_inject_msg(struct rxm_ep *rxm_ep, struct rxm_conn *rxm_conn,
 	rma_buf->pkt.hdr.size = total_size;
 	rma_buf->app_context = msg->context;
 	rma_buf->flags = flags;
+	/* nothing registered: rxm_finish_rma() must not close stale MRs when
+	 * this carries a bounced (non-inject) write */
+	rma_buf->rma.count = 0;
 	rxm_ep_format_rma_msg(rma_buf, msg, &rxm_msg_iov, &rxm_rma_msg);
 
 	flags = (flags & ~FI_INJECT) | FI_COMPLETION;
@@ -381,6 +384,46 @@ unlock:
 	return ret;
 }
 
+static bool
+rxm_ep_rma_can_bounce_write(struct rxm_ep *rxm_ep,
+			    const struct fi_msg_rma *msg)
+{
+	uint64_t device;
+	size_t len;
+
+	if (!rxm_rma_write_bounce_size || !rxm_ep->msg_mr_local ||
+	    rxm_ep->rdm_mr_local)
+		return false;
+
+	len = ofi_total_iov_len(msg->msg_iov, msg->iov_count);
+	return len && len <= rxm_rma_write_bounce_size &&
+	       rxm_iov_desc_to_hmem_iface_dev(msg->msg_iov, msg->desc,
+					      msg->iov_count, &device) ==
+	       FI_HMEM_SYSTEM;
+}
+
+/* Send a small write from a copy in a tx_buf, like an emulated inject, but
+ * keep the caller's flags so it completes as the normal write it is. */
+static ssize_t
+rxm_ep_rma_bounce_write(struct rxm_ep *rxm_ep, const struct fi_msg_rma *msg,
+			uint64_t flags)
+{
+	struct rxm_conn *rxm_conn;
+	ssize_t ret;
+
+	ofi_genlock_lock(&rxm_ep->util_ep.lock);
+
+	ret = rxm_get_conn(rxm_ep, msg->addr, &rxm_conn);
+	if (!ret)
+		ret = rxm_ep_rma_emulate_inject_msg(
+			rxm_ep, rxm_conn,
+			ofi_total_iov_len(msg->msg_iov, msg->iov_count),
+			msg, flags);
+
+	ofi_genlock_unlock(&rxm_ep->util_ep.lock);
+	return ret;
+}
+
 static ssize_t
 rxm_ep_generic_writemsg(struct fid_ep *ep_fid, const struct fi_msg_rma *msg,
 			uint64_t flags)
@@ -390,6 +433,8 @@ rxm_ep_generic_writemsg(struct fid_ep *ep_fid, const struct fi_msg_rma *msg,
 	rxm_ep = container_of(ep_fid, struct rxm_ep, util_ep.ep_fid.fid);
 	if (flags & FI_INJECT)
 		return rxm_ep_rma_inject_common(rxm_ep, msg, flags);
+	else if (rxm_ep_rma_can_bounce_write(rxm_ep, msg))
+		return rxm_ep_rma_bounce_write(rxm_ep, msg, flags);
 	else
 		return rxm_ep_rma_common(rxm_ep, msg, flags,
 					 fi_writemsg, FI_WRITE);
