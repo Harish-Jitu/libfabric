@@ -213,6 +213,11 @@ extern size_t rxm_msg_rx_size;
 extern size_t rxm_cm_progress_interval;
 extern size_t rxm_rma_read_bounce_size;
 extern size_t rxm_rma_write_bounce_size;
+/* RMA bounce: ops up to buffer_size go through one tx_buf; larger ones (up
+ * to the threshold) are split across tx_bufs, at most RXM_RMA_SPLIT_MAX
+ * pieces.  The thresholds are capped at RXM_RMA_BOUNCE_MAX. */
+#define RXM_RMA_BOUNCE_MAX	(1024 * 1024)
+#define RXM_RMA_SPLIT_MAX	64
 extern size_t rxm_cq_eq_fairness;
 extern int rxm_passthru;
 extern int force_auto_progress;
@@ -562,6 +567,15 @@ struct rxm_tx_buf {
 			/* bounced read: user iov to copy pkt.data into */
 			struct iovec iov[RXM_IOV_LIMIT];
 			uint8_t bounce_count;
+			/* split bounce, an op larger than one tx_buf: every
+			 * piece points at the first, which owns the op (user
+			 * context, flags, iov) and finishes it when the last
+			 * piece completes.  NULL for any other RMA. */
+			struct rxm_tx_buf *split_first;
+			size_t split_off;	/* this piece's offset in the op */
+			uint32_t split_left;	/* first piece: pieces in flight */
+			int split_err;		/* first piece: first error, < 0 */
+			bool split_read;	/* first piece */
 		} rma;
 		struct rxm_iov atomic_result;
 	};
@@ -790,6 +804,7 @@ void rxm_cq_write_tx_error(struct rxm_ep *rxm_ep, uint8_t op, void *op_context,
 void rxm_cq_write_rx_error(struct rxm_ep *rxm_ep, uint8_t op, void *op_context,
 			   int err);
 void rxm_cq_write_error_all(struct rxm_ep *rxm_ep, int err);
+void rxm_rma_split_done(struct rxm_ep *rxm_ep, struct rxm_tx_buf *first);
 void rxm_handle_comp_error(struct rxm_ep *rxm_ep);
 ssize_t rxm_handle_comp(struct rxm_ep *rxm_ep, struct fi_cq_data_entry *comp);
 void rxm_thru_comp_error(struct rxm_ep *rxm_ep);

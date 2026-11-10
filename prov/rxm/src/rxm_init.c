@@ -670,14 +670,17 @@ RXM_INI
 			"internal registered buffer and are copied to the user "
 			"buffer on completion, instead of registering the user "
 			"buffer, when the msg provider requires FI_MR_LOCAL. "
-			"Capped at buffer_size. (default: 0, disabled)");
+			"Reads larger than buffer_size are split across "
+			"several internal buffers. Capped at 1 MiB. "
+			"(default: 0, disabled)");
 
 	fi_param_define(&rxm_prov, "rma_write_bounce_size", FI_PARAM_SIZE_T,
 			"Writes of host memory up to this size are copied into "
 			"an internal registered buffer and sent from there, "
 			"instead of registering the user buffer, when the msg "
-			"provider requires FI_MR_LOCAL. Capped at buffer_size. "
-			"(default: 0, disabled)");
+			"provider requires FI_MR_LOCAL. Writes larger than "
+			"buffer_size are split across several internal "
+			"buffers. Capped at 1 MiB. (default: 0, disabled)");
 
 	fi_param_define(&rxm_prov, "comp_per_progress", FI_PARAM_INT,
 			"Defines the maximum number of MSG provider CQ entries "
@@ -785,12 +788,12 @@ RXM_INI
 	fi_param_get_size_t(&rxm_prov, "msg_rx_size", &rxm_msg_rx_size);
 	fi_param_get_size_t(&rxm_prov, "rma_read_bounce_size",
 			    &rxm_rma_read_bounce_size);
-	if (rxm_rma_read_bounce_size > rxm_buffer_size)
-		rxm_rma_read_bounce_size = rxm_buffer_size;
+	if (rxm_rma_read_bounce_size > RXM_RMA_BOUNCE_MAX)
+		rxm_rma_read_bounce_size = RXM_RMA_BOUNCE_MAX;
 	fi_param_get_size_t(&rxm_prov, "rma_write_bounce_size",
 			    &rxm_rma_write_bounce_size);
-	if (rxm_rma_write_bounce_size > rxm_buffer_size)
-		rxm_rma_write_bounce_size = rxm_buffer_size;
+	if (rxm_rma_write_bounce_size > RXM_RMA_BOUNCE_MAX)
+		rxm_rma_write_bounce_size = RXM_RMA_BOUNCE_MAX;
 	if (fi_param_get_int(&rxm_prov, "cm_progress_interval",
 				(int *) &rxm_cm_progress_interval))
 		rxm_cm_progress_interval = 10000;

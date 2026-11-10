@@ -220,10 +220,59 @@ rxm_cq_write_tx_comp(struct rxm_ep *rxm_ep, uint64_t comp_flags,
 	}
 }
 
+/* The op of a split bounce is done: report it once, then release the first
+ * piece (the others were released as they completed). */
+void rxm_rma_split_done(struct rxm_ep *rxm_ep, struct rxm_tx_buf *first)
+{
+	uint8_t op = first->rma.split_read ? ofi_op_read_req : ofi_op_write;
+
+	if (first->rma.split_err) {
+		rxm_cq_write_tx_error(rxm_ep, op, first->app_context,
+				      first->rma.split_err);
+	} else {
+		rxm_cq_write_tx_comp(rxm_ep, FI_RMA |
+				     (first->rma.split_read ? FI_READ : FI_WRITE),
+				     first->app_context, first->flags);
+		ofi_ep_peer_tx_cntr_inc(&rxm_ep->util_ep, op);
+	}
+	rxm_free_tx_buf(rxm_ep, first);
+}
+
+/* One piece of a split bounce completed, with err (< 0) or without. */
+static void rxm_finish_rma_split(struct rxm_ep *rxm_ep,
+				 struct rxm_tx_buf *piece, int err)
+{
+	struct rxm_tx_buf *first = piece->rma.split_first;
+	size_t len __attribute__((unused));
+
+	if (err) {
+		if (!first->rma.split_err)
+			first->rma.split_err = err;
+	} else if (first->rma.split_read) {
+		/* the data must be in the user buffer before the op is
+		 * reported, which happens with the last piece */
+		len = ofi_copy_to_iov(first->rma.iov, first->rma.bounce_count,
+				      piece->rma.split_off, piece->pkt.data,
+				      piece->pkt.hdr.size);
+		assert(len == piece->pkt.hdr.size);
+	}
+
+	if (piece != first)
+		rxm_free_tx_buf(rxm_ep, piece);
+	assert(first->rma.split_left);
+	if (!--first->rma.split_left)
+		rxm_rma_split_done(rxm_ep, first);
+}
+
 static void rxm_finish_rma(struct rxm_ep *rxm_ep, struct rxm_tx_buf *rma_buf,
 			  uint64_t comp_flags)
 {
 	size_t len __attribute__((unused));
+
+	if (rma_buf->rma.split_first) {
+		rxm_finish_rma_split(rxm_ep, rma_buf, 0);
+		return;
+	}
 
 	assert(((comp_flags & FI_WRITE) && !(comp_flags & FI_READ)) ||
 	       ((comp_flags & FI_READ) && !(comp_flags & FI_WRITE)));
@@ -1856,6 +1905,13 @@ void rxm_handle_comp_error(struct rxm_ep *rxm_ep)
 		return;
 	case RXM_RMA:
 		tx_buf = err_entry.op_context;
+		if (tx_buf->rma.split_first) {
+			/* reported once for the whole op, by the last piece */
+			rxm_finish_rma_split(rxm_ep, tx_buf,
+					     err_entry.err ? -err_entry.err :
+							     -FI_EOTHER);
+			return;
+		}
 		err_entry.op_context = tx_buf->app_context;
 		/* err_entry.flags pass through from msg ep */
 		if (!(tx_buf->flags & FI_INJECT) && !rxm_ep->rdm_mr_local &&

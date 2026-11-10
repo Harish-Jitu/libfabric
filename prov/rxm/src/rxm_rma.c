@@ -90,6 +90,7 @@ rxm_ep_rma_can_bounce(struct rxm_ep *rxm_ep, const struct fi_msg_rma *msg,
 	uint64_t device;
 
 	return len && len <= rxm_rma_read_bounce_size &&
+	       len <= rxm_buffer_size &&
 	       rxm_ep->msg_mr_local && !rxm_ep->rdm_mr_local &&
 	       rxm_iov_desc_to_hmem_iface_dev(msg->msg_iov, msg->desc,
 					      msg->iov_count, &device) ==
@@ -115,6 +116,163 @@ rxm_ep_format_bounce_read(struct rxm_tx_buf *rma_buf, struct fi_msg_rma *msg,
 	msg->iov_count = 1;
 }
 
+/* An op larger than one tx_buf but within the bounce threshold: bounce it in
+ * tx_buf-sized pieces, one RDMA op each, instead of registering the user
+ * buffer.  Needs one remote iov (the verbs rma_iov_limit). */
+static bool
+rxm_ep_rma_can_split(struct rxm_ep *rxm_ep, const struct fi_msg_rma *msg,
+		     size_t len, bool read)
+{
+	uint64_t device;
+
+	return len > rxm_buffer_size &&
+	       len <= (read ? rxm_rma_read_bounce_size :
+			      rxm_rma_write_bounce_size) &&
+	       ofi_div_ceil(len, rxm_buffer_size) <= RXM_RMA_SPLIT_MAX &&
+	       msg->rma_iov_count == 1 &&
+	       rxm_ep->msg_mr_local && !rxm_ep->rdm_mr_local &&
+	       rxm_iov_desc_to_hmem_iface_dev(msg->msg_iov, msg->desc,
+					      msg->iov_count, &device) ==
+	       FI_HMEM_SYSTEM;
+}
+
+/* Piece i covers bytes [i * buffer_size, ...) of the op and goes to
+ * rma_iov[0].addr + that offset.  All tx_bufs are taken up front, so
+ * -FI_EAGAIN means nothing was posted.  The first piece owns the op;
+ * rxm_finish_rma_split() reports it once, when the last piece completes.
+ * Flags: FI_FENCE on the first piece only, FI_REMOTE_CQ_DATA on the last
+ * only (it must arrive after all the data), FI_MORE on all but the last. */
+static ssize_t
+rxm_ep_rma_split(struct rxm_ep *rxm_ep, const struct fi_msg_rma *msg,
+		 uint64_t flags, bool read, size_t len)
+{
+	struct rxm_tx_buf *buf[RXM_RMA_SPLIT_MAX], *first;
+	struct rxm_conn *rxm_conn;
+	struct fi_msg_rma piece;
+	struct fi_rma_iov rma_iov;
+	struct iovec iov;
+	uint64_t pflags;
+	size_t n, i, j, off, plen;
+	ssize_t ret;
+
+	n = ofi_div_ceil(len, rxm_buffer_size);
+	assert(n > 1 && n <= RXM_RMA_SPLIT_MAX);
+
+	ofi_genlock_lock(&rxm_ep->util_ep.lock);
+
+	ret = rxm_get_conn(rxm_ep, msg->addr, &rxm_conn);
+	if (ret)
+		goto unlock;
+
+	for (i = 0; i < n; i++) {
+		buf[i] = rxm_get_tx_buf(rxm_ep);
+		if (!buf[i]) {
+			while (i--)
+				rxm_free_tx_buf(rxm_ep, buf[i]);
+			rxm_ep_do_progress(&rxm_ep->util_ep);
+			ret = -FI_EAGAIN;
+			goto unlock;
+		}
+	}
+
+	first = buf[0];
+	first->app_context = msg->context;
+	first->rma.split_left = (uint32_t) n;
+	first->rma.split_err = 0;
+	first->rma.split_read = read;
+	first->rma.bounce_count = 0;
+	if (read) {
+		memcpy(first->rma.iov, msg->msg_iov,
+		       sizeof(*msg->msg_iov) * msg->iov_count);
+		first->rma.bounce_count = (uint8_t) msg->iov_count;
+	}
+
+	for (i = 0, off = 0; i < n; i++, off += plen) {
+		plen = MIN(rxm_buffer_size, len - off);
+		buf[i]->hdr.state = RXM_RMA;
+		buf[i]->pkt.ctrl_hdr.type = rxm_ctrl_eager;
+		buf[i]->pkt.hdr.size = plen;
+		buf[i]->flags = flags;
+		buf[i]->rma.count = 0;
+		buf[i]->rma.split_first = first;
+		buf[i]->rma.split_off = off;
+
+		if (!read) {
+			ret = rxm_copy_from_hmem_iov(msg->desc, buf[i]->pkt.data,
+						     plen, msg->msg_iov,
+						     msg->iov_count, off);
+			assert((size_t) ret == plen);
+		}
+
+		iov.iov_base = buf[i]->pkt.data;
+		iov.iov_len = plen;
+		rma_iov.addr = msg->rma_iov[0].addr + off;
+		rma_iov.len = plen;
+		rma_iov.key = msg->rma_iov[0].key;
+
+		piece.msg_iov = &iov;
+		piece.desc = &buf[i]->hdr.desc;
+		piece.iov_count = 1;
+		piece.addr = msg->addr;
+		piece.rma_iov = &rma_iov;
+		piece.rma_iov_count = 1;
+		piece.context = buf[i];
+		piece.data = msg->data;
+
+		pflags = (flags & ~(FI_INJECT | FI_FENCE | FI_REMOTE_CQ_DATA |
+				    FI_MORE)) | FI_COMPLETION;
+		if (i == 0)
+			pflags |= flags & FI_FENCE;
+		if (i == n - 1)
+			pflags |= flags & (FI_REMOTE_CQ_DATA | FI_MORE);
+		else
+			pflags |= FI_MORE;
+
+		/* once a piece is in flight the op cannot be refused:
+		 * progress until the msg ep takes the rest */
+		do {
+			ret = read ?
+			      fi_readmsg(rxm_conn_msg_ep(rxm_conn, NULL),
+					 &piece, pflags) :
+			      fi_writemsg(rxm_conn_msg_ep(rxm_conn, NULL),
+					  &piece, pflags);
+			if (ret == -FI_EAGAIN && i)
+				rxm_ep_do_progress(&rxm_ep->util_ep);
+		} while (ret == -FI_EAGAIN && i);
+
+		if (!ret)
+			continue;
+
+		if (!i) {
+			/* nothing in flight: refuse the op */
+			for (j = 0; j < n; j++)
+				rxm_free_tx_buf(rxm_ep, buf[j]);
+			if (ret == -FI_EAGAIN)
+				rxm_ep_do_progress(&rxm_ep->util_ep);
+			goto unlock;
+		}
+
+		/* pieces 0..i-1 are in flight: drop the rest and let the op
+		 * complete with this error once they are done */
+		FI_WARN(&rxm_prov, FI_LOG_EP_DATA,
+			"split RMA piece %zu of %zu failed: %zd\n", i, n, ret);
+		first->rma.split_err = (int) ret;
+		for (j = i; j < n; j++)
+			rxm_free_tx_buf(rxm_ep, buf[j]);
+		first->rma.split_left -= (uint32_t) (n - i);
+		/* the pieces in flight may all have completed already
+		 * while this one was retried */
+		if (!first->rma.split_left)
+			rxm_rma_split_done(rxm_ep, first);
+		ret = 0;
+		break;
+	}
+	ret = 0;
+unlock:
+	ofi_genlock_unlock(&rxm_ep->util_ep.lock);
+	return ret;
+}
+
 static ssize_t
 rxm_ep_rma_common(struct rxm_ep *rxm_ep, const struct fi_msg_rma *msg,
 		  uint64_t flags, ssize_t (*rma_msg)(struct fid_ep *ep_fid,
@@ -130,6 +288,11 @@ rxm_ep_rma_common(struct rxm_ep *rxm_ep, const struct fi_msg_rma *msg,
 	ssize_t ret;
 
 	assert(msg->rma_iov_count <= rxm_ep->rxm_info->tx_attr->rma_iov_limit);
+
+	len = ofi_total_iov_len(msg_rma.msg_iov, msg_rma.iov_count);
+	if ((comp_flags & FI_READ) &&
+	    rxm_ep_rma_can_split(rxm_ep, msg, len, true))
+		return rxm_ep_rma_split(rxm_ep, msg, flags, true, len);
 
 	ofi_genlock_lock(&rxm_ep->util_ep.lock);
 
@@ -148,8 +311,8 @@ rxm_ep_rma_common(struct rxm_ep *rxm_ep, const struct fi_msg_rma *msg,
 	rma_buf->app_context = msg->context;
 	rma_buf->flags = flags;
 	rma_buf->rma.bounce_count = 0;
+	rma_buf->rma.split_first = NULL;
 
-	len = ofi_total_iov_len(msg_rma.msg_iov, msg_rma.iov_count);
 	if ((comp_flags & FI_READ) &&
 	    rxm_ep_rma_can_bounce(rxm_ep, &msg_rma, len)) {
 		rxm_ep_format_bounce_read(rma_buf, &msg_rma, &bounce_iov, len);
@@ -294,6 +457,7 @@ rxm_ep_rma_emulate_inject_msg(struct rxm_ep *rxm_ep, struct rxm_conn *rxm_conn,
 	/* nothing registered: rxm_finish_rma() must not close stale MRs when
 	 * this carries a bounced (non-inject) write */
 	rma_buf->rma.count = 0;
+	rma_buf->rma.split_first = NULL;
 	rxm_ep_format_rma_msg(rma_buf, msg, &rxm_msg_iov, &rxm_rma_msg);
 
 	flags = (flags & ~FI_INJECT) | FI_COMPLETION;
@@ -397,6 +561,7 @@ rxm_ep_rma_can_bounce_write(struct rxm_ep *rxm_ep,
 
 	len = ofi_total_iov_len(msg->msg_iov, msg->iov_count);
 	return len && len <= rxm_rma_write_bounce_size &&
+	       len <= rxm_buffer_size &&
 	       rxm_iov_desc_to_hmem_iface_dev(msg->msg_iov, msg->desc,
 					      msg->iov_count, &device) ==
 	       FI_HMEM_SYSTEM;
@@ -435,6 +600,13 @@ rxm_ep_generic_writemsg(struct fid_ep *ep_fid, const struct fi_msg_rma *msg,
 		return rxm_ep_rma_inject_common(rxm_ep, msg, flags);
 	else if (rxm_ep_rma_can_bounce_write(rxm_ep, msg))
 		return rxm_ep_rma_bounce_write(rxm_ep, msg, flags);
+	else if (rxm_ep_rma_can_split(rxm_ep, msg,
+				      ofi_total_iov_len(msg->msg_iov,
+							msg->iov_count),
+				      false))
+		return rxm_ep_rma_split(rxm_ep, msg, flags, false,
+					ofi_total_iov_len(msg->msg_iov,
+							  msg->iov_count));
 	else
 		return rxm_ep_rma_common(rxm_ep, msg, flags,
 					 fi_writemsg, FI_WRITE);
