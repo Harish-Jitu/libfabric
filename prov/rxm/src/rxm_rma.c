@@ -83,14 +83,19 @@ rxm_ep_rma_reg_iov(struct rxm_ep *rxm_ep, const struct iovec *msg_iov,
 	return FI_SUCCESS;
 }
 
+/* Copy the op through registered tx_bufs instead of registering the user
+ * buffer: host memory within the bounce threshold, and only when the msg
+ * provider needs local MRs that the app does not provide.  Ops up to
+ * buffer_size take one tx_buf; larger ones are split, see
+ * rxm_ep_rma_can_split(). */
 static bool
 rxm_ep_rma_can_bounce(struct rxm_ep *rxm_ep, const struct fi_msg_rma *msg,
-		      size_t len)
+		      size_t len, bool read)
 {
 	uint64_t device;
 
-	return len && len <= rxm_rma_read_bounce_size &&
-	       len <= rxm_buffer_size &&
+	return len && len <= (read ? rxm_rma_read_bounce_size :
+				     rxm_rma_write_bounce_size) &&
 	       rxm_ep->msg_mr_local && !rxm_ep->rdm_mr_local &&
 	       rxm_iov_desc_to_hmem_iface_dev(msg->msg_iov, msg->desc,
 					      msg->iov_count, &device) ==
@@ -116,24 +121,16 @@ rxm_ep_format_bounce_read(struct rxm_tx_buf *rma_buf, struct fi_msg_rma *msg,
 	msg->iov_count = 1;
 }
 
-/* An op larger than one tx_buf but within the bounce threshold: bounce it in
- * tx_buf-sized pieces, one RDMA op each, instead of registering the user
- * buffer.  Needs one remote iov (the verbs rma_iov_limit). */
+/* A bounce larger than one tx_buf: send it in tx_buf-sized pieces, one RDMA
+ * op each.  Needs one remote iov (the verbs rma_iov_limit). */
 static bool
 rxm_ep_rma_can_split(struct rxm_ep *rxm_ep, const struct fi_msg_rma *msg,
 		     size_t len, bool read)
 {
-	uint64_t device;
-
 	return len > rxm_buffer_size &&
-	       len <= (read ? rxm_rma_read_bounce_size :
-			      rxm_rma_write_bounce_size) &&
 	       ofi_div_ceil(len, rxm_buffer_size) <= RXM_RMA_SPLIT_MAX &&
 	       msg->rma_iov_count == 1 &&
-	       rxm_ep->msg_mr_local && !rxm_ep->rdm_mr_local &&
-	       rxm_iov_desc_to_hmem_iface_dev(msg->msg_iov, msg->desc,
-					      msg->iov_count, &device) ==
-	       FI_HMEM_SYSTEM;
+	       rxm_ep_rma_can_bounce(rxm_ep, msg, len, read);
 }
 
 /* Piece i covers bytes [i * buffer_size, ...) of the op and goes to
@@ -313,8 +310,8 @@ rxm_ep_rma_common(struct rxm_ep *rxm_ep, const struct fi_msg_rma *msg,
 	rma_buf->rma.bounce_count = 0;
 	rma_buf->rma.split_first = NULL;
 
-	if ((comp_flags & FI_READ) &&
-	    rxm_ep_rma_can_bounce(rxm_ep, &msg_rma, len)) {
+	if ((comp_flags & FI_READ) && len <= rxm_buffer_size &&
+	    rxm_ep_rma_can_bounce(rxm_ep, &msg_rma, len, true)) {
 		rxm_ep_format_bounce_read(rma_buf, &msg_rma, &bounce_iov, len);
 	} else {
 		ret = rxm_ep_rma_reg_iov(rxm_ep, msg_rma.msg_iov, msg_rma.desc,
@@ -548,25 +545,6 @@ unlock:
 	return ret;
 }
 
-static bool
-rxm_ep_rma_can_bounce_write(struct rxm_ep *rxm_ep,
-			    const struct fi_msg_rma *msg)
-{
-	uint64_t device;
-	size_t len;
-
-	if (!rxm_rma_write_bounce_size || !rxm_ep->msg_mr_local ||
-	    rxm_ep->rdm_mr_local)
-		return false;
-
-	len = ofi_total_iov_len(msg->msg_iov, msg->iov_count);
-	return len && len <= rxm_rma_write_bounce_size &&
-	       len <= rxm_buffer_size &&
-	       rxm_iov_desc_to_hmem_iface_dev(msg->msg_iov, msg->desc,
-					      msg->iov_count, &device) ==
-	       FI_HMEM_SYSTEM;
-}
-
 /* Send a small write from a copy in a tx_buf, like an emulated inject, but
  * keep the caller's flags so it completes as the normal write it is. */
 static ssize_t
@@ -594,19 +572,18 @@ rxm_ep_generic_writemsg(struct fid_ep *ep_fid, const struct fi_msg_rma *msg,
 			uint64_t flags)
 {
 	struct rxm_ep *rxm_ep;
+	size_t len;
 
 	rxm_ep = container_of(ep_fid, struct rxm_ep, util_ep.ep_fid.fid);
 	if (flags & FI_INJECT)
 		return rxm_ep_rma_inject_common(rxm_ep, msg, flags);
-	else if (rxm_ep_rma_can_bounce_write(rxm_ep, msg))
+
+	len = ofi_total_iov_len(msg->msg_iov, msg->iov_count);
+	if (len <= rxm_buffer_size &&
+	    rxm_ep_rma_can_bounce(rxm_ep, msg, len, false))
 		return rxm_ep_rma_bounce_write(rxm_ep, msg, flags);
-	else if (rxm_ep_rma_can_split(rxm_ep, msg,
-				      ofi_total_iov_len(msg->msg_iov,
-							msg->iov_count),
-				      false))
-		return rxm_ep_rma_split(rxm_ep, msg, flags, false,
-					ofi_total_iov_len(msg->msg_iov,
-							  msg->iov_count));
+	else if (rxm_ep_rma_can_split(rxm_ep, msg, len, false))
+		return rxm_ep_rma_split(rxm_ep, msg, flags, false, len);
 	else
 		return rxm_ep_rma_common(rxm_ep, msg, flags,
 					 fi_writemsg, FI_WRITE);
